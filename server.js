@@ -12,6 +12,24 @@ const upload = multer({ dest: 'uploads/' });
 app.use(express.static('public'));
 app.use(express.json());
 
+const GLOBAL_KEYWORDS = [
+  'game', 'workspace', 'Players', 'ReplicatedStorage', 'Lighting',
+  'task', 'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime',
+  'Instance', 'TweenService', 'Color3', 'Vector2', 'Vector3', 'UDim2', 'UDim',
+  'CFrame', 'Enum', 'math', 'os', 'table', 'string', 'coroutine',
+  'pcall', 'xpcall', 'require', 'loadstring', 'getgenv', 'getfenv', 'setfenv',
+  'rawget', 'rawset', 'rawequal', 'rawlen',
+  'Networking', 'CollectionService', 'PlayerStateClient',
+  'RaycastParams', 'Random', 'ColorSequence', 'ColorSequenceKeypoint',
+  'Faces', 'Axes', 'BrickColor', 'CatalogSearchParams', 'DebuggerManager',
+  'NumberRange', 'NumberSequence', 'NumberSequenceKeypoint',
+  'OverlapParams', 'Path', 'PathWaypoint', 'PhysicalProperties',
+  'Random', 'Ray', 'RaycastParams', 'Rect', 'Region3',
+  'Region3int16', 'SharedTable', 'TweenInfo', 'UDim', 'UDim2',
+  'Vector2', 'Vector3', 'Vector3int16', 'DateTime', 'DockWidgetPluginGui',
+  'Faces', 'Axes', 'BrickColor', 'CatalogSearchParams'
+];
+
 function lightObfuscate(code) {
   const strings = [];
   const stringRegex = /(["'])(?:(?=(\\?))\2.)*?\1/g;
@@ -22,27 +40,109 @@ function lightObfuscate(code) {
   const unique = [...new Set(strings)];
   const key = crypto.randomBytes(4).readUInt32LE(0);
   const keyByte = key & 0xFF;
-  const tableEntries = {};
+  const allMappings = {};
+
+  // Thêm các string literal
   unique.forEach((s, i) => {
     const content = s.slice(1, -1);
     const encrypted = [...content].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
-    tableEntries[i + 1] = encrypted;
+    allMappings[i + 1] = encrypted;
   });
-  let tableCode = 'local _S={}\n';
-  for (const [idx, enc] of Object.entries(tableEntries)) {
-    tableCode += `_S[${idx}]="${enc}"\n`;
+
+  // Thêm các global keywords (chỉ những từ thực sự xuất hiện trong code)
+  const usedGlobals = [];
+  for (const kw of GLOBAL_KEYWORDS) {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp('\\b' + escaped + '\\b', 'g');
+    if (regex.test(code)) {
+      usedGlobals.push(kw);
+    }
   }
+
+  // Tạo mapping cho global keywords
+  let idx = unique.length + 1;
+  const globalMap = {};
+  for (const kw of usedGlobals) {
+    const encrypted = [...kw].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
+    allMappings[idx] = encrypted;
+    globalMap[kw] = idx;
+    idx++;
+  }
+
+  let tableCode = 'local _S={}\n';
+  for (const [i, enc] of Object.entries(allMappings)) {
+    tableCode += `_S[${i}]="${enc}"\n`;
+  }
+
+  // Thay thế string literals trước (độ dài dài hơn trước)
   let newCode = code;
-  unique.forEach((orig, i) => {
+  const sortedUnique = [...unique].sort((a, b) => b.length - a.length);
+  sortedUnique.forEach((orig, i) => {
     const idx = i + 1;
     const repl = `(_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end))`;
     newCode = newCode.split(orig).join(repl);
   });
-  newCode = newCode.replace(/\blocal\s+([a-zA-Z_][a-zA-Z0-9_]*)/g, (match, name) => {
-    if (['_S', 'string', 'char', 'byte', 'gsub'].includes(name)) return match;
-    return `local ${[...Array(name.length)].map(() => 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random()*26)]).join('')}`;
-  });
-  return tableCode + '\n' + newCode + '\n-- Junk: ' + Math.random().toString(36).substring(2,10);
+
+  // Thay thế global keywords
+  for (const kw of Object.keys(globalMap).sort((a,b) => b.length - a.length)) {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp('\\b' + escaped + '\\b', 'g');
+    const idx = globalMap[kw];
+    newCode = newCode.replace(regex, `_G[_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end())]`);
+  }
+
+  // Đổi tên tất cả biến local (cả local function)
+  // Tìm tất cả khai báo local: local name = ... hoặc local function name(...)
+  const localDeclRegex = /local\s+(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+  const declaredLocals = new Set();
+  let declMatch;
+  while ((declMatch = localDeclRegex.exec(newCode)) !== null) {
+    declaredLocals.add(declMatch[1]);
+  }
+
+  // Tạo tên mới ngẫu nhiên
+  const renameMap = {};
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz';
+  for (const name of declaredLocals) {
+    let newName;
+    do {
+      newName = Array.from({length: 8 + Math.floor(Math.random() * 5)}, () => alphabet[Math.floor(Math.random() * 26)]).join('');
+    } while (Object.values(renameMap).includes(newName) || GLOBAL_KEYWORDS.includes(newName));
+    renameMap[name] = newName;
+  }
+
+  // Thay thế tên biến trong toàn bộ code (trừ string, đã thay trước đó)
+  for (const [oldName, newName] of Object.entries(renameMap)) {
+    const escaped = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp('\\b' + escaped + '\\b', 'g');
+    newCode = newCode.replace(regex, newName);
+  }
+
+  // Chèn anti-debug
+  const antiDebug = `
+local __dbg = debug
+if __dbg then
+ __dbg.setmetatable = nil
+ __dbg.getmetatable = nil
+ __dbg.getfenv = nil
+ __dbg.setfenv = nil
+ __dbg.getinfo = nil
+ __dbg.getlocal = nil
+ __dbg.setlocal = nil
+ __dbg.getupvalue = nil
+ __dbg.setupvalue = nil
+ __dbg.sethook = function() end
+ __dbg.gethook = function() end
+end
+local __hook = hookfunction or hookfunc
+if __hook then
+ __hook(print, function() end)
+ __hook(warn, function() end)
+ __hook(error, function() end)
+end
+`;
+
+  return antiDebug + tableCode + '\n' + newCode + '\n-- Junk: ' + Math.random().toString(36).substring(2,10);
 }
 
 function heavyObfuscate(code) {
@@ -108,7 +208,6 @@ end)()`;
     const outFile = tmpFile + '.out';
     fs.writeFileSync(tmpFile, code);
     try {
-      let args = [];
       try {
         execFileSync('luajit', ['-b', '-s', tmpFile, outFile], { timeout: 5000 });
       } catch {
