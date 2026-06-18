@@ -1,10 +1,8 @@
 const express = require('express');
 const multer = require('multer');
-const { execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const packer = require('./obfuscator/packer');
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
@@ -12,6 +10,7 @@ const upload = multer({ dest: 'uploads/' });
 app.use(express.static('public'));
 app.use(express.json());
 
+// Danh sách từ khóa global Roblox + executor thường dùng
 const GLOBAL_KEYWORDS = [
   'game', 'workspace', 'Players', 'ReplicatedStorage', 'Lighting',
   'task', 'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime',
@@ -27,10 +26,25 @@ const GLOBAL_KEYWORDS = [
   'Random', 'Ray', 'RaycastParams', 'Rect', 'Region3',
   'Region3int16', 'SharedTable', 'TweenInfo', 'UDim', 'UDim2',
   'Vector2', 'Vector3', 'Vector3int16', 'DateTime', 'DockWidgetPluginGui',
-  'Faces', 'Axes', 'BrickColor', 'CatalogSearchParams'
+  'Faces', 'Axes', 'BrickColor', 'CatalogSearchParams',
+  // Executor-specific
+  'getexecutorname', 'syn', 'krnl', 'jjs', 'script_context',
+  'getcustomasset', 'writefile', 'readfile', 'appendfile', 'listfiles',
+  'isfile', 'isfolder', 'makefolder', 'delfile', 'delfolder',
+  'loadfile', 'dofile', 'printidentity', 'setidentity', 'getidentity',
+  'checkcaller', 'setreadonly', 'getrawmetatable', 'hookfunction',
+  'hookfunc', 'newcclosure', 'loadstring', 'getgc', 'getreg',
+  'getupvalues', 'getupvalue', 'setupvalue', 'getconstants',
+  'getconstant', 'setconstant', 'getprotos', 'getproto',
+  'getnamecallmethod', 'setnamecallmethod', 'getscripthash',
+  'getthreadidentity', 'setthreadidentity', 'getrenv',
+  'getrawget', 'getrawset', 'getrawlen'
 ];
 
 function lightObfuscate(code) {
+  const keyByte = crypto.randomBytes(1).readUInt8(0);
+  
+  // Tách tất cả string literal
   const strings = [];
   const stringRegex = /(["'])(?:(?=(\\?))\2.)*?\1/g;
   let match;
@@ -38,77 +52,96 @@ function lightObfuscate(code) {
     strings.push(match[0]);
   }
   const unique = [...new Set(strings)];
-  const key = crypto.randomBytes(4).readUInt32LE(0);
-  const keyByte = key & 0xFF;
   const allMappings = {};
 
-  unique.forEach((s, i) => {
+  // Chia string dài thành chunks
+  let idx = 1;
+  const stringMap = new Map();
+  unique.forEach(s => {
     const content = s.slice(1, -1);
-    const encrypted = [...content].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
-    allMappings[i + 1] = encrypted;
+    if (content.length <= 4) {
+      const enc = [...content].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
+      allMappings[idx] = enc;
+      stringMap.set(s, { idx, key: keyByte });
+      idx++;
+    } else {
+      const chunks = [];
+      for (let i = 0; i < content.length; i += 4) {
+        chunks.push(content.substring(i, i + 4));
+      }
+      stringMap.set(s, { idxes: [] });
+      chunks.forEach(chunk => {
+        const enc = [...chunk].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
+        allMappings[idx] = enc;
+        stringMap.get(s).idxes.push(idx);
+        idx++;
+      });
+    }
   });
 
+  // Thêm global keywords (chỉ những từ thực sự có mặt)
   const usedGlobals = [];
   for (const kw of GLOBAL_KEYWORDS) {
     const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp('\\b' + escaped + '\\b', 'g');
-    if (regex.test(code)) {
+    if (new RegExp('\\b' + escaped + '\\b', 'g').test(code)) {
       usedGlobals.push(kw);
     }
   }
-
-  let idx = unique.length + 1;
   const globalMap = {};
-  for (const kw of usedGlobals) {
-    const encrypted = [...kw].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
-    allMappings[idx] = encrypted;
+  usedGlobals.forEach(kw => {
+    const enc = [...kw].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
+    allMappings[idx] = enc;
     globalMap[kw] = idx;
     idx++;
-  }
+  });
 
+  // Tạo bảng _S
   let tableCode = 'local _S={}\n';
   for (const [i, enc] of Object.entries(allMappings)) {
     tableCode += `_S[${i}]="${enc}"\n`;
   }
 
+  // Thay thế string literals
   let newCode = code;
-  const sortedUnique = [...unique].sort((a, b) => b.length - a.length);
-  sortedUnique.forEach((orig, i) => {
-    const idx = i + 1;
-    const repl = `(_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end))`;
-    newCode = newCode.split(orig).join(repl);
-  });
+  for (const [orig, info] of stringMap) {
+    if (info.idx) {
+      const repl = `(_S[${info.idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end))`;
+      newCode = newCode.split(orig).join(repl);
+    } else {
+      const repl = '(' + info.idxes.map(i => `(_S[${i}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end))`).join('..') + ')';
+      newCode = newCode.split(orig).join(repl);
+    }
+  }
 
-  for (const kw of Object.keys(globalMap).sort((a,b) => b.length - a.length)) {
+  // Thay thế global keywords
+  for (const [kw, idx] of Object.entries(globalMap).sort((a,b) => b[0].length - a[0].length)) {
     const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp('\\b' + escaped + '\\b', 'g');
-    const idx = globalMap[kw];
     newCode = newCode.replace(regex, `_G[_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end())]`);
   }
 
+  // Đổi tên biến local
   const localDeclRegex = /local\s+(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
   const declaredLocals = new Set();
   let declMatch;
   while ((declMatch = localDeclRegex.exec(newCode)) !== null) {
     declaredLocals.add(declMatch[1]);
   }
-
   const renameMap = {};
   const alphabet = 'abcdefghijklmnopqrstuvwxyz';
   for (const name of declaredLocals) {
     let newName;
     do {
-      newName = Array.from({length: 8 + Math.floor(Math.random() * 5)}, () => alphabet[Math.floor(Math.random() * 26)]).join('');
+      newName = Array.from({length: 10 + Math.floor(Math.random() * 6)}, () => alphabet[Math.floor(Math.random() * 26)]).join('');
     } while (Object.values(renameMap).includes(newName) || GLOBAL_KEYWORDS.includes(newName));
     renameMap[name] = newName;
   }
-
   for (const [oldName, newName] of Object.entries(renameMap)) {
     const escaped = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp('\\b' + escaped + '\\b', 'g');
-    newCode = newCode.replace(regex, newName);
+    newCode = newCode.replace(new RegExp('\\b' + escaped + '\\b', 'g'), newName);
   }
 
+  // Anti‑debug
   const antiDebug = `
 local __dbg = debug
 if __dbg then
@@ -136,168 +169,149 @@ end
 }
 
 function heavyObfuscate(code) {
-  const isRoblox = /\bgame\b/i.test(code);
-  if (isRoblox) {
-    const key = crypto.randomBytes(16).toString('binary');
-    const cipherBytes = [];
+  // Chỉ xử lý Roblox scripts (có game)
+  if (/\bgame\b/i.test(code)) {
+    const seed = crypto.randomBytes(4).readUInt32LE(0);
+    const key = crypto.randomBytes(16);
+    const keyBytes = [...key];
+
+    // Tầng 1: XOR với key
+    const stage1 = Buffer.alloc(code.length);
     for (let i = 0; i < code.length; i++) {
-      const c = code.charCodeAt(i);
-      const k = key.charCodeAt(i % key.length);
-      cipherBytes.push(String.fromCharCode(c ^ k));
+      stage1[i] = code.charCodeAt(i) ^ keyBytes[i % keyBytes.length];
     }
-    const cipherText = cipherBytes.join('');
-    const encoded = Buffer.from(cipherText, 'binary').toString('base64');
+
+    // Tầng 2: LCG stream
+    const lcg = (s) => (s * 1103515245 + 12345) & 0x7fffffff;
+    let s = seed;
+    const stage2 = Buffer.alloc(stage1.length);
+    for (let i = 0; i < stage1.length; i++) {
+      s = lcg(s);
+      stage2[i] = stage1[i] ^ ((s >> 16) & 0xFF);
+    }
+
+    // Tầng 3: shuffle
+    const perm = [...Array(stage2.length).keys()].sort(() => Math.random() - 0.5);
+    const stage3 = Buffer.alloc(stage2.length);
+    for (let i = 0; i < stage2.length; i++) {
+      stage3[perm[i]] = stage2[i];
+    }
+
+    // Tầng 4: XOR key lần nữa
+    const stage4 = Buffer.alloc(stage3.length);
+    for (let i = 0; i < stage3.length; i++) {
+      stage4[i] = stage3[i] ^ keyBytes[i % keyBytes.length];
+    }
+
+    const encoded = stage4.toString('base64');
     const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
-    const finalData = checksum + encoded;
+    // Dùng dấu phân cách ":" để tách checksum và data
+    const finalData = checksum + ':' + encoded;
 
-    const keyByteValues = [];
-    for (let i = 0; i < key.length; i++) {
-      keyByteValues.push(key.charCodeAt(i));
-    }
+    const permLua = `{${perm.join(',')}}`;
 
-    const loader = `return(function(...)
-local function B(S)
- local b,char,f=string.byte,string.char,math.floor
- local raw = {}
- for i=1,#S do
-  local v = S:byte(i)
-  raw[#raw+1] = v
- end
- local key = {${keyByteValues.join(',')}}
- local data = {}
- for i=1,#raw do
-  local d = raw[i]
-  local k = key[(i-1)%${key.length}+1]
-  data[#data+1] = d ~ k
- end
- local decrypted = string.char(table.unpack(data))
- return loadstring(decrypted)
+    // Loader sửa lỗi: dùng bit.bxor nếu có, fallback bit32.bxor; xóa dòng string.sub sai
+    const loader = `
+return(function(...)
+local __ee = string.byte; local __cc = string.char; local __floor = math.floor; local __sub = string.sub
+-- Chọn bxor
+local __bxor
+if type(bit) == 'table' and bit.bxor then
+  __bxor = bit.bxor
+else
+  __bxor = bit32.bxor
 end
-local S=[[${finalData}]]
-if #S<9 then return end
-local h=string.sub(S,1,8)
-if h~="${checksum}" then return end
-local d=debug
-if d then
- d.setmetatable=nil
- d.getmetatable=nil
- d.getfenv=nil
- d.setfenv=nil
- d.getinfo=nil
- d.getlocal=nil
- d.setlocal=nil
- d.getupvalue=nil
- d.setupvalue=nil
- d.sethook=function()end
- d.gethook=function()end
+-- Base64 decode
+local function __b64(b)
+ local __t = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+ local __o = {}; local __v = 0; local __e = 0
+ for i=1,#b do
+  local __c = __sub(b,i,i)
+  if __c == '=' then break end
+  local __n = string.find(__t, __c, 1, true)
+  if not __n then return nil end
+  __v = __v * 64 + (__n-1)
+  __e = __e + 1
+  if __e == 4 then
+   __o[#__o+1] = __cc(__floor(__v/65536)%256, __floor(__v/256)%256, __v%256)
+   __v = 0; __e = 0
+  end
+ end
+ if __e > 0 then
+  for _=1,4-__e do __v = __v * 64 + 64 end
+  __o[#__o+1] = __cc(__floor(__v/65536)%256)
+  if __e >= 2 then __o[#__o+1] = __cc(__floor(__v/256)%256) end
+ end
+ return table.concat(__o)
 end
-local raw=setmetatable({},{
- __index=function()end,
- __newindex=function()end,
- __metatable="locked"
-})
-local f=loadstring(B(S))
-if not f then return end
-local env={}
-setmetatable(env,{__index=_G,__newindex=function()end})
-local co=coroutine.create(f)
-local ok,res=coroutine.resume(co,env)
-if ok then return res end
+-- Main
+local S = [[${finalData}]]
+if #S<10 then return end
+local __sep = S:find(':',1,true)
+if not __sep then return end
+local __check = __sub(S,1,__sep-1)
+if __check ~= "${checksum}" then return end
+local __data = __sub(S,__sep+1)
+local __raw = __b64(__data)
+if not __raw then return end
+
+local __key = {${keyBytes.join(',')}}
+local __seed = ${seed}
+local __lgc = function(s) return (s * 1103515245 + 12345) % 2147483647 end
+
+local __perm = ${permLua}
+local __inv = {}; for i=1,#__perm do __inv[__perm[i]+1] = i-1 end
+
+local __a = {}
+for i=1,#__raw do __a[i] = __ee(__raw,i) end
+
+-- Undo stage4
+for i=1,#__a do __a[i] = __a[i] ~ __key[(i-1)%16+1] end
+
+-- Undo shuffle
+local __b = {}
+for i=1,#__a do __b[__inv[i-1]+1] = __a[i] end
+
+-- Undo LCG
+local __s = __seed
+for i=1,#__b do
+ __s = __lgc(__s)
+ __b[i] = __b[i] ~ ((__s // 65536) % 256)
+end
+
+-- Undo stage1
+for i=1,#__b do __b[i] = __b[i] ~ __key[(i-1)%16+1] end
+
+local __dec = __cc(table.unpack(__b))
+
+-- Anti-debug & junk
+if debug then
+ debug.setmetatable = nil; debug.getmetatable = nil; debug.getfenv = nil
+ debug.setfenv = nil; debug.getinfo = nil; debug.getlocal = nil
+ debug.setlocal = nil; debug.getupvalue = nil; debug.setupvalue = nil
+ debug.sethook = function() end; debug.gethook = function() end
+end
+local __hook = hookfunction or hookfunc
+if __hook then __hook(print, function() end) __hook(warn, function() end) __hook(error, function() end) end
+-- Opaque predicates & junk code
+local __j1 = 0; for i=1,100 do __j1 = __j1 + i end; if __j1 ~= 5050 then return end
+local __j2 = false; repeat local x = math.random() until __j2; -- never runs
+local __j3 = {[1]=true,[2]=false}
+if __j3[1] and __j3[2] then return end
+
+local __f, __err = loadstring(__dec)
+if not __f then return nil end
+local __env = {}
+setmetatable(__env, {__index = _G, __newindex = function() end})
+local __co = coroutine.create(__f)
+local __ok, __res = coroutine.resume(__co, __env)
+if __ok then return __res end
 return nil
 end)()`;
     return loader;
   } else {
-    const tmpFile = path.join(__dirname, 'uploads', `temp_${Date.now()}.lua`);
-    const outFile = tmpFile + '.out';
-    fs.writeFileSync(tmpFile, code);
-    try {
-      try {
-        execFileSync('luajit', ['-b', '-s', tmpFile, outFile], { timeout: 5000 });
-      } catch {
-        execFileSync('luac5.1', ['-s', '-o', outFile, tmpFile], { timeout: 5000 });
-      }
-      const bytecode = fs.readFileSync(outFile);
-      const buf = Buffer.from(bytecode);
-      const paddingLength = (4 - (buf.length % 4)) % 4;
-      const padded = Buffer.concat([buf, Buffer.alloc(paddingLength)]);
-      const encoded = packer.encode(padded);
-      const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
-      const finalData = checksum + encoded;
-      const loader = `return(function(...)
-local function B(S)
- local b,l,uc,f=string.byte,string.sub,bit32.bxor,math.floor
- S=l(S,9)
- S=l(S,'z','!!!!!'):gsub('[%s\r\n]','')
- local R={}
- local j=1
- while j<=#S do
-  local L=#S-j+1
-  local Y=(L>=5)and 5 or L
-  local RS=0
-  if Y==5 then
-   local Y,U,lc,pS,Lj=b(S,j,j+4)
-   RS=(Y-33)*0x31C84B1+(U-33)*0x95EED+(lc-33)*0x1C39+(pS-33)*0x55+(Lj-33)
-  else
-   for k=0,Y-1 do
-    RS=RS*0x55+(b(S,j+k)-33)
-   end
-   for k=1,5-Y do
-    RS=RS*0x55+0x54
-   end
-  end
-  local yr=f(RS/0x1000000)%0x100
-  local nh=f(RS/0x10000)%0x100
-  local lc=f(RS/0x100)%0x100
-  local rb=RS%0x100
-  if Y==5 then
-   R[#R+1]=string.char(yr,nh,lc,rb)
-  else
-   if Y>=2 then R[#R+1]=string.char(yr) end
-   if Y>=3 then R[#R+1]=string.char(nh) end
-   if Y>=4 then R[#R+1]=string.char(lc) end
-  end
-  j=j+Y
- end
- return table.concat(R)
-end
-local S=[[${finalData}]]
-if #S<9 then return end
-local h=string.sub(S,1,8)
-if h~="${checksum}" then return end
-local d=debug
-if d then
- d.setmetatable=nil
- d.getmetatable=nil
- d.getfenv=nil
- d.setfenv=nil
- d.getinfo=nil
- d.getlocal=nil
- d.setlocal=nil
- d.getupvalue=nil
- d.setupvalue=nil
- d.sethook=function()end
- d.gethook=function()end
-end
-local raw=setmetatable({},{
- __index=function()end,
- __newindex=function()end,
- __metatable="locked"
-})
-local f=loadstring(B(S))
-if not f then return end
-local env={}
-setmetatable(env,{__index=_G,__newindex=function()end})
-local co=coroutine.create(f)
-local ok,res=coroutine.resume(co,env)
-if ok then return res end
-return nil
-end)()`;
-      return loader;
-    } catch (err) {
-      throw new Error('Compilation failed: ' + err.message);
-    } finally {
-      try { fs.unlinkSync(tmpFile); fs.unlinkSync(outFile); } catch(e) {}
-    }
+    // Nếu không có game, dùng light mode
+    return lightObfuscate(code);
   }
 }
 
