@@ -42,14 +42,12 @@ function lightObfuscate(code) {
   const keyByte = key & 0xFF;
   const allMappings = {};
 
-  // Thêm các string literal
   unique.forEach((s, i) => {
     const content = s.slice(1, -1);
     const encrypted = [...content].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
     allMappings[i + 1] = encrypted;
   });
 
-  // Thêm các global keywords (chỉ những từ thực sự xuất hiện trong code)
   const usedGlobals = [];
   for (const kw of GLOBAL_KEYWORDS) {
     const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -59,7 +57,6 @@ function lightObfuscate(code) {
     }
   }
 
-  // Tạo mapping cho global keywords
   let idx = unique.length + 1;
   const globalMap = {};
   for (const kw of usedGlobals) {
@@ -74,7 +71,6 @@ function lightObfuscate(code) {
     tableCode += `_S[${i}]="${enc}"\n`;
   }
 
-  // Thay thế string literals trước (độ dài dài hơn trước)
   let newCode = code;
   const sortedUnique = [...unique].sort((a, b) => b.length - a.length);
   sortedUnique.forEach((orig, i) => {
@@ -83,7 +79,6 @@ function lightObfuscate(code) {
     newCode = newCode.split(orig).join(repl);
   });
 
-  // Thay thế global keywords
   for (const kw of Object.keys(globalMap).sort((a,b) => b.length - a.length)) {
     const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp('\\b' + escaped + '\\b', 'g');
@@ -91,8 +86,6 @@ function lightObfuscate(code) {
     newCode = newCode.replace(regex, `_G[_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end())]`);
   }
 
-  // Đổi tên tất cả biến local (cả local function)
-  // Tìm tất cả khai báo local: local name = ... hoặc local function name(...)
   const localDeclRegex = /local\s+(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
   const declaredLocals = new Set();
   let declMatch;
@@ -100,7 +93,6 @@ function lightObfuscate(code) {
     declaredLocals.add(declMatch[1]);
   }
 
-  // Tạo tên mới ngẫu nhiên
   const renameMap = {};
   const alphabet = 'abcdefghijklmnopqrstuvwxyz';
   for (const name of declaredLocals) {
@@ -111,14 +103,12 @@ function lightObfuscate(code) {
     renameMap[name] = newName;
   }
 
-  // Thay thế tên biến trong toàn bộ code (trừ string, đã thay trước đó)
   for (const [oldName, newName] of Object.entries(renameMap)) {
     const escaped = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp('\\b' + escaped + '\\b', 'g');
     newCode = newCode.replace(regex, newName);
   }
 
-  // Chèn anti-debug
   const antiDebug = `
 local __dbg = debug
 if __dbg then
@@ -148,27 +138,40 @@ end
 function heavyObfuscate(code) {
   const isRoblox = /\bgame\b/i.test(code);
   if (isRoblox) {
-    const key = crypto.randomBytes(16);
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-128-cbc', key, iv);
-    let encrypted = cipher.update(code, 'utf8', 'base64');
-    encrypted += cipher.final('base64');
-    const payload = iv.toString('base64') + ':' + encrypted;
-    const checksum = crypto.createHash('sha256').update(payload).digest('hex').substring(0,8);
-    const finalData = checksum + payload;
+    const key = crypto.randomBytes(16).toString('binary');
+    const cipherBytes = [];
+    for (let i = 0; i < code.length; i++) {
+      const c = code.charCodeAt(i);
+      const k = key.charCodeAt(i % key.length);
+      cipherBytes.push(String.fromCharCode(c ^ k));
+    }
+    const cipherText = cipherBytes.join('');
+    const encoded = Buffer.from(cipherText, 'binary').toString('base64');
+    const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
+    const finalData = checksum + encoded;
+
+    const keyByteValues = [];
+    for (let i = 0; i < key.length; i++) {
+      keyByteValues.push(key.charCodeAt(i));
+    }
+
     const loader = `return(function(...)
 local function B(S)
- local b,l,f=string.byte,string.sub,math.floor
- local ivEnc,data = S:match(":(.*)$"), S:match("^(.*):")
- if not ivEnc then return end
- local iv = {}
- for i=1,#ivEnc do iv[#iv+1]=b(ivEnc,i) end
- local key = {${[...key].join(',')}}
- local cipher = require("crypto")
- if not cipher then return end
- local decrypt = cipher.decrypt("aes-128-cbc", key, iv, data)
- if not decrypt then return end
- return loadstring(decrypt)
+ local b,char,f=string.byte,string.char,math.floor
+ local raw = {}
+ for i=1,#S do
+  local v = S:byte(i)
+  raw[#raw+1] = v
+ end
+ local key = {${keyByteValues.join(',')}}
+ local data = {}
+ for i=1,#raw do
+  local d = raw[i]
+  local k = key[(i-1)%${key.length}+1]
+  data[#data+1] = d ~ k
+ end
+ local decrypted = string.char(table.unpack(data))
+ return loadstring(decrypted)
 end
 local S=[[${finalData}]]
 if #S<9 then return end
