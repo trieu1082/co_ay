@@ -21,23 +21,21 @@ function lightObfuscate(code) {
   }
   const unique = [...new Set(strings)];
   const key = crypto.randomBytes(4).readUInt32LE(0);
+  const keyByte = key & 0xFF;
   const tableEntries = {};
   unique.forEach((s, i) => {
     const content = s.slice(1, -1);
-    const encrypted = [...content].map(c => String.fromCharCode(c.charCodeAt(0) ^ (key & 0xFF))).join('');
-    const idx = Math.floor(Math.random() * 8000) + 100;
-    tableEntries[idx] = { enc: encrypted };
+    const encrypted = [...content].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
+    tableEntries[i + 1] = encrypted;
   });
   let tableCode = 'local _S={}\n';
-  const idxMap = {};
-  Object.keys(tableEntries).forEach((idx, i) => {
-    tableCode += `_S[${idx}]="${tableEntries[idx].enc}"\n`;
-    idxMap[i] = idx;
-  });
+  for (const [idx, enc] of Object.entries(tableEntries)) {
+    tableCode += `_S[${idx}]="${enc}"\n`;
+  }
   let newCode = code;
   unique.forEach((orig, i) => {
-    const idx = Object.keys(idxMap)[i];
-    const repl = `(_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${key & 0xFF})end))`;
+    const idx = i + 1;
+    const repl = `(_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end))`;
     newCode = newCode.split(orig).join(repl);
   });
   newCode = newCode.replace(/\blocal\s+([a-zA-Z_][a-zA-Z0-9_]*)/g, (match, name) => {
@@ -48,31 +46,85 @@ function lightObfuscate(code) {
 }
 
 function heavyObfuscate(code) {
-  const tmpFile = path.join(__dirname, 'uploads', `temp_${Date.now()}.lua`);
-  const outFile = tmpFile + '.out';
-  fs.writeFileSync(tmpFile, code);
-  try {
-    let compiler = 'luajit';
-    let args = ['-b', '-s', tmpFile, outFile];
-    try {
-      execFileSync('luajit', args, { timeout: 5000 });
-    } catch {
-      compiler = 'luac5.1';
-      args = ['-s', '-o', outFile, tmpFile];
-      execFileSync('luac5.1', args, { timeout: 5000 });
-    }
-    const bytecode = fs.readFileSync(outFile);
-    const buf = Buffer.from(bytecode);
-    const paddingLength = (4 - (buf.length % 4)) % 4;
-    const padded = Buffer.concat([buf, Buffer.alloc(paddingLength)]);
-    const encoded = packer.encode(padded);
-    const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
-    const finalData = checksum + encoded;  // Ghép checksum vào đầu
-
+  const isRoblox = /\bgame\b/i.test(code);
+  if (isRoblox) {
+    const key = crypto.randomBytes(16);
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-128-cbc', key, iv);
+    let encrypted = cipher.update(code, 'utf8', 'base64');
+    encrypted += cipher.final('base64');
+    const payload = iv.toString('base64') + ':' + encrypted;
+    const checksum = crypto.createHash('sha256').update(payload).digest('hex').substring(0,8);
+    const finalData = checksum + payload;
     const loader = `return(function(...)
 local function B(S)
+ local b,l,f=string.byte,string.sub,math.floor
+ local ivEnc,data = S:match(":(.*)$"), S:match("^(.*):")
+ if not ivEnc then return end
+ local iv = {}
+ for i=1,#ivEnc do iv[#iv+1]=b(ivEnc,i) end
+ local key = {${[...key].join(',')}}
+ local cipher = require("crypto")
+ if not cipher then return end
+ local decrypt = cipher.decrypt("aes-128-cbc", key, iv, data)
+ if not decrypt then return end
+ return loadstring(decrypt)
+end
+local S=[[${finalData}]]
+if #S<9 then return end
+local h=string.sub(S,1,8)
+if h~="${checksum}" then return end
+local d=debug
+if d then
+ d.setmetatable=nil
+ d.getmetatable=nil
+ d.getfenv=nil
+ d.setfenv=nil
+ d.getinfo=nil
+ d.getlocal=nil
+ d.setlocal=nil
+ d.getupvalue=nil
+ d.setupvalue=nil
+ d.sethook=function()end
+ d.gethook=function()end
+end
+local raw=setmetatable({},{
+ __index=function()end,
+ __newindex=function()end,
+ __metatable="locked"
+})
+local f=loadstring(B(S))
+if not f then return end
+local env={}
+setmetatable(env,{__index=_G,__newindex=function()end})
+local co=coroutine.create(f)
+local ok,res=coroutine.resume(co,env)
+if ok then return res end
+return nil
+end)()`;
+    return loader;
+  } else {
+    const tmpFile = path.join(__dirname, 'uploads', `temp_${Date.now()}.lua`);
+    const outFile = tmpFile + '.out';
+    fs.writeFileSync(tmpFile, code);
+    try {
+      let args = [];
+      try {
+        execFileSync('luajit', ['-b', '-s', tmpFile, outFile], { timeout: 5000 });
+      } catch {
+        execFileSync('luac5.1', ['-s', '-o', outFile, tmpFile], { timeout: 5000 });
+      }
+      const bytecode = fs.readFileSync(outFile);
+      const buf = Buffer.from(bytecode);
+      const paddingLength = (4 - (buf.length % 4)) % 4;
+      const padded = Buffer.concat([buf, Buffer.alloc(paddingLength)]);
+      const encoded = packer.encode(padded);
+      const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
+      const finalData = checksum + encoded;
+      const loader = `return(function(...)
+local function B(S)
  local b,l,uc,f=string.byte,string.sub,bit32.bxor,math.floor
- S=l(S,9)  -- Bỏ qua 8 ký tự checksum
+ S=l(S,9)
  S=l(S,'z','!!!!!'):gsub('[%s\r\n]','')
  local R={}
  local j=1
@@ -138,11 +190,12 @@ local ok,res=coroutine.resume(co,env)
 if ok then return res end
 return nil
 end)()`;
-    return loader;
-  } catch (err) {
-    throw new Error('Compilation failed: ' + err.message);
-  } finally {
-    try { fs.unlinkSync(tmpFile); fs.unlinkSync(outFile); } catch(e) {}
+      return loader;
+    } catch (err) {
+      throw new Error('Compilation failed: ' + err.message);
+    } finally {
+      try { fs.unlinkSync(tmpFile); fs.unlinkSync(outFile); } catch(e) {}
+    }
   }
 }
 
