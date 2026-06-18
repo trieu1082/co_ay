@@ -10,7 +10,7 @@ const upload = multer({ dest: 'uploads/' });
 app.use(express.static('public'));
 app.use(express.json());
 
-// Danh sách từ khóa global Roblox + executor thường dùng
+// Danh sách từ khóa global Roblox + executor
 const GLOBAL_KEYWORDS = [
   'game', 'workspace', 'Players', 'ReplicatedStorage', 'Lighting',
   'task', 'spawn', 'delay', 'wait', 'tick', 'time', 'elapsedTime',
@@ -27,7 +27,6 @@ const GLOBAL_KEYWORDS = [
   'Region3int16', 'SharedTable', 'TweenInfo', 'UDim', 'UDim2',
   'Vector2', 'Vector3', 'Vector3int16', 'DateTime', 'DockWidgetPluginGui',
   'Faces', 'Axes', 'BrickColor', 'CatalogSearchParams',
-  // Executor-specific
   'getexecutorname', 'syn', 'krnl', 'jjs', 'script_context',
   'getcustomasset', 'writefile', 'readfile', 'appendfile', 'listfiles',
   'isfile', 'isfolder', 'makefolder', 'delfile', 'delfolder',
@@ -41,10 +40,9 @@ const GLOBAL_KEYWORDS = [
   'getrawget', 'getrawset', 'getrawlen'
 ];
 
+// ---------- Light Obfuscation (giữ nguyên) ----------
 function lightObfuscate(code) {
   const keyByte = crypto.randomBytes(1).readUInt8(0);
-  
-  // Tách tất cả string literal
   const strings = [];
   const stringRegex = /(["'])(?:(?=(\\?))\2.)*?\1/g;
   let match;
@@ -53,8 +51,6 @@ function lightObfuscate(code) {
   }
   const unique = [...new Set(strings)];
   const allMappings = {};
-
-  // Chia string dài thành chunks
   let idx = 1;
   const stringMap = new Map();
   unique.forEach(s => {
@@ -79,7 +75,6 @@ function lightObfuscate(code) {
     }
   });
 
-  // Thêm global keywords (chỉ những từ thực sự có mặt)
   const usedGlobals = [];
   for (const kw of GLOBAL_KEYWORDS) {
     const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -95,13 +90,11 @@ function lightObfuscate(code) {
     idx++;
   });
 
-  // Tạo bảng _S
   let tableCode = 'local _S={}\n';
   for (const [i, enc] of Object.entries(allMappings)) {
     tableCode += `_S[${i}]="${enc}"\n`;
   }
 
-  // Thay thế string literals
   let newCode = code;
   for (const [orig, info] of stringMap) {
     if (info.idx) {
@@ -113,14 +106,12 @@ function lightObfuscate(code) {
     }
   }
 
-  // Thay thế global keywords
   for (const [kw, idx] of Object.entries(globalMap).sort((a,b) => b[0].length - a[0].length)) {
     const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp('\\b' + escaped + '\\b', 'g');
     newCode = newCode.replace(regex, `_G[_S[${idx}]:gsub(".",function(c)return string.char(string.byte(c)~${keyByte})end())]`);
   }
 
-  // Đổi tên biến local
   const localDeclRegex = /local\s+(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
   const declaredLocals = new Set();
   let declMatch;
@@ -141,7 +132,6 @@ function lightObfuscate(code) {
     newCode = newCode.replace(new RegExp('\\b' + escaped + '\\b', 'g'), newName);
   }
 
-  // Anti‑debug
   const antiDebug = `
 local __dbg = debug
 if __dbg then
@@ -168,90 +158,101 @@ end
   return antiDebug + tableCode + '\n' + newCode + '\n-- Junk: ' + Math.random().toString(36).substring(2,10);
 }
 
+// ---------- Heavy Obfuscation (sửa loader) ----------
 function heavyObfuscate(code) {
-  // Chỉ xử lý Roblox scripts (có game)
-  if (/\bgame\b/i.test(code)) {
-    const seed = crypto.randomBytes(4).readUInt32LE(0);
-    const key = crypto.randomBytes(16);
-    const keyBytes = [...key];
+  if (!/\bgame\b/i.test(code)) {
+    return lightObfuscate(code);
+  }
 
-    // Tầng 1: XOR với key
-    const stage1 = Buffer.alloc(code.length);
-    for (let i = 0; i < code.length; i++) {
-      stage1[i] = code.charCodeAt(i) ^ keyBytes[i % keyBytes.length];
-    }
+  const seed = crypto.randomBytes(4).readUInt32LE(0);
+  const key = crypto.randomBytes(16);
+  const keyBytes = [...key];
 
-    // Tầng 2: LCG stream
-    const lcg = (s) => (s * 1103515245 + 12345) & 0x7fffffff;
-    let s = seed;
-    const stage2 = Buffer.alloc(stage1.length);
-    for (let i = 0; i < stage1.length; i++) {
-      s = lcg(s);
-      stage2[i] = stage1[i] ^ ((s >> 16) & 0xFF);
-    }
+  const codeBytes = Buffer.from(code, 'utf8');
 
-    // Tầng 3: shuffle
-    const perm = [...Array(stage2.length).keys()].sort(() => Math.random() - 0.5);
-    const stage3 = Buffer.alloc(stage2.length);
-    for (let i = 0; i < stage2.length; i++) {
-      stage3[perm[i]] = stage2[i];
-    }
+  // Stage 1: XOR key
+  const stage1 = Buffer.alloc(codeBytes.length);
+  for (let i = 0; i < codeBytes.length; i++) {
+    stage1[i] = codeBytes[i] ^ keyBytes[i % keyBytes.length];
+  }
 
-    // Tầng 4: XOR key lần nữa
-    const stage4 = Buffer.alloc(stage3.length);
-    for (let i = 0; i < stage3.length; i++) {
-      stage4[i] = stage3[i] ^ keyBytes[i % keyBytes.length];
-    }
+  // Stage 2: LCG stream
+  const lcg = (s) => (s * 1103515245 + 12345) & 0x7fffffff;
+  let s = seed;
+  const stage2 = Buffer.alloc(stage1.length);
+  for (let i = 0; i < stage1.length; i++) {
+    s = lcg(s);
+    stage2[i] = stage1[i] ^ ((s >> 16) & 0xFF);
+  }
 
-    const encoded = stage4.toString('base64');
-    const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
-    // Dùng dấu phân cách ":" để tách checksum và data
-    const finalData = checksum + ':' + encoded;
+  // Stage 3: Shuffle
+  const perm = [...Array(stage2.length).keys()].sort(() => Math.random() - 0.5);
+  const stage3 = Buffer.alloc(stage2.length);
+  for (let i = 0; i < stage2.length; i++) {
+    stage3[perm[i]] = stage2[i];
+  }
 
-    const permLua = `{${perm.join(',')}}`;
+  // Stage 4: XOR key again
+  const stage4 = Buffer.alloc(stage3.length);
+  for (let i = 0; i < stage3.length; i++) {
+    stage4[i] = stage3[i] ^ keyBytes[i % keyBytes.length];
+  }
 
-    // Loader sửa lỗi: dùng bit.bxor nếu có, fallback bit32.bxor; xóa dòng string.sub sai
-    const loader = `
+  const encoded = stage4.toString('base64');
+  const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
+  const finalData = checksum + ':' + encoded;
+  const permLua = `{${perm.join(',')}}`;
+
+  // Loader cải tiến
+  const loader = `
 return(function(...)
 local __ee = string.byte; local __cc = string.char; local __floor = math.floor; local __sub = string.sub
--- Chọn bxor
-local __bxor
-if type(bit) == 'table' and bit.bxor then
-  __bxor = bit.bxor
-else
-  __bxor = bit32.bxor
-end
--- Base64 decode
+
+-- Base64 decode (tra cứu trực tiếp)
 local function __b64(b)
- local __t = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
- local __o = {}; local __v = 0; local __e = 0
- for i=1,#b do
-  local __c = __sub(b,i,i)
-  if __c == '=' then break end
-  local __n = string.find(__t, __c, 1, true)
-  if not __n then return nil end
-  __v = __v * 64 + (__n-1)
-  __e = __e + 1
-  if __e == 4 then
-   __o[#__o+1] = __cc(__floor(__v/65536)%256, __floor(__v/256)%256, __v%256)
-   __v = 0; __e = 0
+  local __t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  local __o = {}
+  local __v, __e = 0, 0
+  for i = 1, #b do
+    local __c = __sub(b, i, i)
+    if __c == '=' then break end
+    local __n = nil
+    for j = 1, 64 do
+      if __sub(__t, j, j) == __c then __n = j-1; break end
+    end
+    if not __n then return nil end
+    __v = __v * 64 + __n
+    __e = __e + 1
+    if __e == 4 then
+      __o[#__o+1] = __cc(__floor(__v/65536)%256, __floor(__v/256)%256, __v%256)
+      __v = 0; __e = 0
+    end
   end
- end
- if __e > 0 then
-  for _=1,4-__e do __v = __v * 64 + 64 end
-  __o[#__o+1] = __cc(__floor(__v/65536)%256)
-  if __e >= 2 then __o[#__o+1] = __cc(__floor(__v/256)%256) end
- end
- return table.concat(__o)
+  if __e > 0 then
+    for _ = 1, 4-__e do __v = __v * 64 + 64 end
+    __o[#__o+1] = __cc(__floor(__v/65536)%256)
+    if __e >= 2 then __o[#__o+1] = __cc(__floor(__v/256)%256) end
+  end
+  return table.concat(__o)
 end
+
+-- XOR fallback
+local function __xor(a, b)
+  if type(bit) == 'table' and bit.bxor then
+    return bit.bxor(a, b)
+  else
+    return bit32.bxor(a, b)
+  end
+end
+
 -- Main
 local S = [[${finalData}]]
-if #S<10 then return end
-local __sep = S:find(':',1,true)
+if #S < 10 then return end
+local __sep = S:find(':', 1, true)
 if not __sep then return end
-local __check = __sub(S,1,__sep-1)
+local __check = __sub(S, 1, __sep-1)
 if __check ~= "${checksum}" then return end
-local __data = __sub(S,__sep+1)
+local __data = __sub(S, __sep+1)
 local __raw = __b64(__data)
 if not __raw then return end
 
@@ -260,27 +261,28 @@ local __seed = ${seed}
 local __lgc = function(s) return (s * 1103515245 + 12345) % 2147483647 end
 
 local __perm = ${permLua}
-local __inv = {}; for i=1,#__perm do __inv[__perm[i]+1] = i-1 end
+local __inv = {}
+for i = 1, #__perm do __inv[__perm[i]+1] = i-1 end
 
 local __a = {}
-for i=1,#__raw do __a[i] = __ee(__raw,i) end
+for i = 1, #__raw do __a[i] = __ee(__raw, i) end
 
 -- Undo stage4
-for i=1,#__a do __a[i] = __a[i] ~ __key[(i-1)%16+1] end
+for i = 1, #__a do __a[i] = __xor(__a[i], __key[(i-1)%16+1]) end
 
 -- Undo shuffle
 local __b = {}
-for i=1,#__a do __b[__inv[i-1]+1] = __a[i] end
+for i = 1, #__a do __b[__inv[i-1]+1] = __a[i] end
 
--- Undo LCG
+-- Undo stage2
 local __s = __seed
-for i=1,#__b do
- __s = __lgc(__s)
- __b[i] = __b[i] ~ ((__s // 65536) % 256)
+for i = 1, #__b do
+  __s = __lgc(__s)
+  __b[i] = __xor(__b[i], ((__s // 65536) % 256))
 end
 
 -- Undo stage1
-for i=1,#__b do __b[i] = __b[i] ~ __key[(i-1)%16+1] end
+for i = 1, #__b do __b[i] = __xor(__b[i], __key[(i-1)%16+1]) end
 
 local __dec = __cc(table.unpack(__b))
 
@@ -293,11 +295,9 @@ if debug then
 end
 local __hook = hookfunction or hookfunc
 if __hook then __hook(print, function() end) __hook(warn, function() end) __hook(error, function() end) end
--- Opaque predicates & junk code
 local __j1 = 0; for i=1,100 do __j1 = __j1 + i end; if __j1 ~= 5050 then return end
 local __j2 = false; repeat local x = math.random() until __j2; -- never runs
-local __j3 = {[1]=true,[2]=false}
-if __j3[1] and __j3[2] then return end
+local __j3 = {[1]=true,[2]=false}; if __j3[1] and __j3[2] then return end
 
 local __f, __err = loadstring(__dec)
 if not __f then return nil end
@@ -307,14 +307,12 @@ local __co = coroutine.create(__f)
 local __ok, __res = coroutine.resume(__co, __env)
 if __ok then return __res end
 return nil
-end)()`;
-    return loader;
-  } else {
-    // Nếu không có game, dùng light mode
-    return lightObfuscate(code);
-  }
+end)()
+`;
+  return loader;
 }
 
+// ---------- Routes ----------
 app.post('/obfuscate', upload.single('file'), (req, res) => {
   try {
     let code = '';
