@@ -67,9 +67,13 @@ function heavyObfuscate(code) {
     const padded = Buffer.concat([buf, Buffer.alloc(paddingLength)]);
     const encoded = packer.encode(padded);
     const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
+    const finalData = checksum + encoded;  // Ghép checksum vào đầu
+
     const loader = `return(function(...)
 local function B(S)
  local b,l,uc,f=string.byte,string.sub,bit32.bxor,math.floor
+ S=l(S,9)  -- Bỏ qua 8 ký tự checksum
+ S=l(S,'z','!!!!!'):gsub('[%s\r\n]','')
  local R={}
  local j=1
  while j<=#S do
@@ -102,8 +106,8 @@ local function B(S)
  end
  return table.concat(R)
 end
-local S=[[${encoded}]]
-if #S==0 then return end
+local S=[[${finalData}]]
+if #S<9 then return end
 local h=string.sub(S,1,8)
 if h~="${checksum}" then return end
 local d=debug
