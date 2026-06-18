@@ -31,14 +31,11 @@ const GLOBAL_KEYWORDS = [
 ];
 
 function lightObfuscate(code) {
-  // giữ nguyên bản light đã ổn (nhưng tôi chép lại toàn bộ để file đầy đủ)
   const keyByte = crypto.randomBytes(1).readUInt8(0);
   const strings = [];
   const stringRegex = /(["'])(?:(?=(\\?))\2.)*?\1/g;
   let match;
-  while ((match = stringRegex.exec(code)) !== null) {
-    strings.push(match[0]);
-  }
+  while ((match = stringRegex.exec(code)) !== null) strings.push(match[0]);
   const unique = [...new Set(strings)];
   const allMappings = {};
   let idx = 1;
@@ -48,7 +45,7 @@ function lightObfuscate(code) {
     if (content.length <= 4) {
       const enc = [...content].map(c => String.fromCharCode(c.charCodeAt(0) ^ keyByte)).join('');
       allMappings[idx] = enc;
-      stringMap.set(s, { idx, key: keyByte });
+      stringMap.set(s, { idx });
       idx++;
     } else {
       const chunks = [];
@@ -60,7 +57,7 @@ function lightObfuscate(code) {
         idxes.push(idx);
         idx++;
       });
-      stringMap.set(s, { idxes, key: keyByte });
+      stringMap.set(s, { idxes });
     }
   });
 
@@ -144,7 +141,6 @@ end
 
 function heavyObfuscate(code) {
   if (!/\bgame\b/i.test(code)) {
-    // non-Roblox: giữ nguyên bytecode cũ (không dùng cho trường hợp này)
     const tmpFile = path.join(__dirname, 'uploads', `temp_${Date.now()}.lua`);
     const outFile = tmpFile + '.out';
     fs.writeFileSync(tmpFile, code);
@@ -218,80 +214,38 @@ end)()`;
     }
   }
 
-  // ---------- Roblox heavy mode (XOR + BASE64 chính xác) ----------
-  const key1 = crypto.randomBytes(16); // key tầng 1
-  const key2 = crypto.randomBytes(8);  // key tầng 2
-  const key3 = crypto.randomBytes(4);  // key tầng 3
+  // ---------- Roblox heavy mode (table of bytes, no base64) ----------
+  const key1 = crypto.randomBytes(16);
+  const key2 = crypto.randomBytes(8);
+  const key3 = crypto.randomBytes(4);
 
-  // Tầng 1: XOR với key1
   const buf1 = Buffer.alloc(code.length);
   for (let i = 0; i < code.length; i++) buf1[i] = code.charCodeAt(i) ^ key1[i % 16];
-
-  // Tầng 2: XOR với key2 (quay vòng)
   const buf2 = Buffer.alloc(buf1.length);
   for (let i = 0; i < buf1.length; i++) buf2[i] = buf1[i] ^ key2[i % 8];
-
-  // Tầng 3: XOR với key3
   const buf3 = Buffer.alloc(buf2.length);
   for (let i = 0; i < buf2.length; i++) buf3[i] = buf2[i] ^ key3[i % 4];
 
-  const encoded = buf3.toString('base64');
-  const checksum = crypto.createHash('sha256').update(encoded).digest('hex').substring(0,8);
-  const finalData = checksum + encoded;
+  const dataBytes = [...buf3]; // mảng số nguyên 0-255
+  const dataStr = '{' + dataBytes.join(',') + '}';
 
   const k1 = [...key1], k2 = [...key2], k3 = [...key3];
 
-  // Lua base64 decode hoàn chỉnh (tự viết, không dùng require)
   const loader = `
 return(function(...)
-local __b, __c, __f, __s, __bx = string.byte, string.char, math.floor, string.sub, bit32.bxor
+local __b, __c, __f, __bx = string.byte, string.char, math.floor, bit32.bxor
 
--- base64 decode -------------------------------------------------
-local function __b64(d)
- local __t = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
- local __o = {}
- local __n, __v, __e = 0, 0, 0
- for i = 1, #d do
-  local __ch = __s(d, i, i)
-  if __ch == '=' then break end
-  local __idx = (string.find(__t, __ch, 1, true) or 0) - 1
-  __v = __v * 64 + __idx
-  __e = __e + 1
-  if __e == 4 then
-   __o[#__o+1] = __c(__f(__v/65536)%256, __f(__v/256)%256, __v%256)
-   __v, __e = 0, 0
-  end
- end
- if __e > 0 then
-  for _=1,4-__e do __v = __v * 64 + 64 end
-  __o[#__o+1] = __c(__f(__v/65536)%256)
-  if __e >= 2 then __o[#__o+1] = __c(__f(__v/256)%256) end
- end
- return table.concat(__o)
-end
-
--- Main decryption ------------------------------------------------
-local __S = [[${finalData}]]
-if #__S < 9 then return end
-local __h = __s(__S, 1, 8)
-if __h ~= "${checksum}" then return end
-__S = __s(__S, 9)
-local __raw = __b64(__S)
-if not __raw then return end
-
+local __data = ${dataStr}
 local __k1 = {${k1.join(',')}}
 local __k2 = {${k2.join(',')}}
 local __k3 = {${k3.join(',')}}
 
-local __len = #__raw
+local __len = #__data
 local __a = {}
-for i = 1, __len do __a[i] = __b(__raw, i) end
+for i = 1, __len do __a[i] = __data[i] end
 
--- Undo tầng 3
 for i = 1, __len do __a[i] = __a[i] ~ __k3[(i-1)%4+1] end
--- Undo tầng 2
 for i = 1, __len do __a[i] = __a[i] ~ __k2[(i-1)%8+1] end
--- Undo tầng 1
 for i = 1, __len do __a[i] = __a[i] ~ __k1[(i-1)%16+1] end
 
 local __dec = __c(table.unpack(__a))
@@ -310,7 +264,7 @@ if __hk then
  __hk(warn, function() end)
  __hk(error, function() end)
 end
--- Junk code (chạy thật, không phải comment)
+
 local __j1 = 0; for i = 1, 150 do __j1 = __j1 + i end; if __j1 ~= 11325 then return end
 local __j2 = {}; for i = 1, 10 do __j2[i] = math.random() end; __j2 = nil
 local __j3 = 0; repeat __j3 = __j3 + 1 until __j3 > 10
